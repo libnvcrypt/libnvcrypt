@@ -1,0 +1,559 @@
+diff --git a/configure.ac b/configure.ac
+index d267a50..6024d84 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -47,6 +47,11 @@ AC_CHECK_LIB(uuid, uuid_clear, ,[AC_MSG_ERROR([You need the uuid library.])])
+ AC_SUBST(UUID_LIBS, $LIBS)
+ LIBS=$saved_LIBS
+ 
++saved_LIBS=$LIBS
++AC_CHECK_LIB(nvcrypt, nv_initialize, ,[AC_MSG_ERROR([You need the nvcrypt library.])])
++AC_SUBST(NVCRYPT_LIBS, $LIBS)
++LIBS=$saved_LIBS
++
+ AC_SEARCH_LIBS([clock_gettime],[rt posix4])
+ AC_CHECK_FUNCS([posix_memalign clock_gettime])
+ 
+diff --git a/lib/Makefile.am b/lib/Makefile.am
+index 6662568..19ba1c3 100644
+--- a/lib/Makefile.am
++++ b/lib/Makefile.am
+@@ -39,6 +39,7 @@ libcryptsetup_la_LIBADD = \
+ 	@UUID_LIBS@				\
+ 	@DEVMAPPER_LIBS@			\
+ 	@CRYPTO_LIBS@				\
++	@NVCRYPT_LIBS@				\
+ 	$(common_ldadd)
+ 
+ 
+diff --git a/lib/libcryptsetup.h b/lib/libcryptsetup.h
+index bf223a2..c75d1f0 100644
+--- a/lib/libcryptsetup.h
++++ b/lib/libcryptsetup.h
+@@ -37,6 +37,7 @@ extern "C" {
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ 
+ struct crypt_device; /* crypt device handle */
+ 
+@@ -58,6 +59,16 @@ struct crypt_device; /* crypt device handle */
+ int crypt_init(struct crypt_device **cd, const char *device);
+ 
+ /**
++ * Use a second password stored in TPM NVRAM for this device.
++ */
++void crypt_use_nvram(struct crypt_device *cd, bool use_nvram);
++
++/**
++ * Returns whether the TPM NVRAM is used for this device.
++ */
++bool crypt_nvram_in_use(struct crypt_device *cd);
++
++/**
+  * Initialize crypt device handle from provided active device name,
+  * and, optionally, from separate metadata (header) device
+  * and check if provided device exists.
+diff --git a/lib/libcryptsetup.sym b/lib/libcryptsetup.sym
+index 27c5cb4..cd3dab6 100644
+--- a/lib/libcryptsetup.sym
++++ b/lib/libcryptsetup.sym
+@@ -2,6 +2,8 @@ CRYPTSETUP_1.0 {
+ 	global:
+ 		crypt_init;
+ 		crypt_init_by_name;
++		crypt_use_nvram;
++		crypt_nvram_in_use;
+ 		crypt_init_by_name_and_header;
+ 		crypt_set_log_callback;
+ 		crypt_set_confirm_callback;
+diff --git a/lib/luks1/keymanage.c b/lib/luks1/keymanage.c
+index d1d16cf..66b5a52 100644
+--- a/lib/luks1/keymanage.c
++++ b/lib/luks1/keymanage.c
+@@ -33,6 +33,8 @@
+ #include <assert.h>
+ #include <uuid/uuid.h>
+ 
++#include <libnvcrypt.h>
++
+ #include "luks.h"
+ #include "af.h"
+ #include "internal.h"
+@@ -765,6 +767,62 @@ int LUKS_hdr_uuid_set(
+ 	return LUKS_write_phdr(hdr, ctx);
+ }
+ 
++static int NV_append_new_password(struct crypt_device *ctx,
++				  int keyIndex,
++				  const char *password,
++				  size_t password_len,
++				  char **password2,
++				  size_t *password2_len)
++{
++	char *pw = NULL;
++	size_t pw_len = 0;
++
++	log_dbg("Initializing TPM NVRAM storage for saving a new second password");
++	if (nv_initialize() < 0) {
++		log_dbg("nvram initializiation failed");
++		return -EINVAL;
++	}
++
++	if (password_len+NV_KEY_SIZE >= DEFAULT_PASSPHRASE_SIZE_MAX) {
++		log_err(ctx, _("passphrase is too large for adding second passphrase from NVRAM\n"));
++		return -EINVAL;
++	}
++
++	struct nv_keyslot *ks = nv_keyslot_new(crypt_get_uuid(ctx), keyIndex);
++	if (ks == NULL) {
++		log_err(ctx, _("TPM NVRAM keyslot allocation failed\n"));
++		return -EINVAL;
++	}
++
++	pw = crypt_safe_alloc(DEFAULT_PASSPHRASE_SIZE_MAX);
++	if (!pw) {
++		nv_keyslot_free(ks);
++		return -EINVAL;
++	}
++
++	strncpy(pw, password, DEFAULT_PASSPHRASE_SIZE_MAX);
++
++	nv_keyslot_get_key(ks, (char *)&pw[password_len]);
++	pw_len = password_len+NV_KEY_SIZE;
++
++	if (nv_keyslot_save(ks) < 0) {
++		log_err(ctx, _("saving keyslot in TPM NVRAM failed\n"));
++		nv_keyslot_free(ks);
++		crypt_safe_free(pw);
++		return -EINVAL;
++	}
++
++	nv_keyslot_free(ks);
++
++	log_dbg("new second password for device with uuid %s (index %d) saved",
++		crypt_get_uuid(ctx), keyIndex);
++
++	*password2 = pw;
++	*password2_len = pw_len;
++
++	return 0;
++}
++
+ int LUKS_set_key(unsigned int keyIndex,
+ 		 const char *password, size_t passwordLen,
+ 		 struct luks_phdr *hdr, struct volume_key *vk,
+@@ -777,6 +835,8 @@ int LUKS_set_key(unsigned int keyIndex,
+ 	size_t AFEKSize;
+ 	uint64_t PBKDF2_temp;
+ 	int r;
++	char *password2 = (char *)password;
++	size_t password2_len = passwordLen;
+ 
+ 	if(hdr->keyblock[keyIndex].active != LUKS_KEY_DISABLED) {
+ 		log_err(ctx, _("Key slot %d active, purge first.\n"), keyIndex);
+@@ -822,6 +882,19 @@ int LUKS_set_key(unsigned int keyIndex,
+ 	if (r < 0)
+ 		goto out;
+ 
++	if (crypt_nvram_in_use(ctx)) {
++		r = NV_append_new_password(ctx, keyIndex, password, passwordLen, &password2, &password2_len);
++		if (r < 0) {
++			log_std(ctx, "adding new password to TPM NVRAM failed\n");
++			goto out;
++		}
++		log_std(ctx, "added new password to TPM NVRAM\n");
++		password = password2;
++		passwordLen = password2_len;
++	} else {
++		log_dbg("skip adding second password in TPM NVRAM");
++	}
++
+ 	r = crypt_pbkdf("pbkdf2", hdr->hashSpec, password, passwordLen,
+ 			hdr->keyblock[keyIndex].passwordSalt, LUKS_SALTSIZE,
+ 			derived_key->key, hdr->keyBytes,
+@@ -869,6 +942,9 @@ int LUKS_set_key(unsigned int keyIndex,
+ 
+ 	r = 0;
+ out:
++	if (password != password2) {
++		crypt_safe_free(password2);
++	}
+ 	crypt_safe_free(AfKey);
+ 	crypt_free_volume_key(derived_key);
+ 	return r;
+@@ -959,6 +1035,56 @@ out:
+ 	return r;
+ }
+ 
++static int NV_password_appended(struct crypt_device *ctx,
++				int keyIndex,
++				const char *password,
++				size_t password_len,
++				char **password2,
++				size_t *password2_len)
++{
++	char *pw = NULL;
++	size_t pw_len = 0;
++
++	log_dbg("Initializing TPM NVRAM storage for reading a new second password");
++	if (nv_initialize() < 0) {
++		log_dbg("nvram initializiation failed");
++		return -EINVAL;
++	}
++
++	if (password_len+NV_KEY_SIZE >= DEFAULT_PASSPHRASE_SIZE_MAX) {
++		log_err(ctx, _("passphrase is too large for adding second passphrase from NVRAM\n"));
++		return -EINVAL;
++	}
++
++	struct nv_keyslot *ks = nv_keyslot_by_uuid(crypt_get_uuid(ctx), keyIndex);
++	if (ks == NULL) {
++		log_dbg("TPM NVRAM keyslot for uuid %s (index %d) not found",
++				crypt_get_uuid(ctx), keyIndex);
++
++		*password2 = NULL;
++		*password2_len = 0;
++		return -EINVAL;
++	}
++
++	pw = crypt_safe_alloc(DEFAULT_PASSPHRASE_SIZE_MAX);
++	if (!pw) {
++		return -EINVAL;
++	}
++
++	strncpy(pw, password, DEFAULT_PASSPHRASE_SIZE_MAX);
++	pw_len = password_len;
++
++	nv_keyslot_get_key(ks, (char *)&pw[password_len]);
++	pw_len = password_len+NV_KEY_SIZE;
++
++	nv_keyslot_free(ks);
++
++	*password2 = pw;
++	*password2_len = pw_len;
++
++	return 0;
++}
++
+ int LUKS_open_key_with_hdr(int keyIndex,
+ 			   const char *password,
+ 			   size_t passwordLen,
+@@ -968,15 +1094,52 @@ int LUKS_open_key_with_hdr(int keyIndex,
+ {
+ 	unsigned int i;
+ 	int r;
++	char *password2 = NULL;
++	size_t password2Len = 0;
+ 
+ 	*vk = crypt_alloc_volume_key(hdr->keyBytes, NULL);
+ 
+ 	if (keyIndex >= 0) {
++		r = NV_password_appended(ctx, keyIndex, password, passwordLen, &password2, &password2Len);
++		if (r == 0) {
++			log_dbg("found second password in TPM NVRAM for uuid %s (index %d)",
++				crypt_get_uuid(ctx), keyIndex);
++			log_std(ctx, "found password in TPM NVRAM\n");
++
++			// remember to use the nvram for other actions with this device
++			crypt_use_nvram(ctx, true);
++
++			r = LUKS_open_key(keyIndex, password2, password2Len, hdr, *vk, ctx);
++			crypt_safe_free(password2);
++			if (r == 0) {
++				log_std(ctx, "opened device with password from TPM NVRAM\n");
++				return keyIndex;
++			}
++		}
++
+ 		r = LUKS_open_key(keyIndex, password, passwordLen, hdr, *vk, ctx);
+ 		return (r < 0) ? r : keyIndex;
+ 	}
+ 
+ 	for(i = 0; i < LUKS_NUMKEYS; i++) {
++		r = NV_password_appended(ctx, i, password, passwordLen, &password2, &password2Len);
++		if (r == 0) {
++			log_dbg("found second password in TPM NVRAM for uuid %s (index %d)",
++					crypt_get_uuid(ctx), i);
++			log_std(ctx, "found password in TPM NVRAM\n");
++
++			// remember to use the nvram for other actions with this device
++			crypt_use_nvram(ctx, true);
++
++			r = LUKS_open_key(i, password2, password2Len, hdr, *vk, ctx);
++			if(r == 0) {
++				log_std(ctx, "opened device with password from TPM NVRAM\n");
++				return i;
++			}
++
++			crypt_safe_free(password2);
++		}
++
+ 		r = LUKS_open_key(i, password, passwordLen, hdr, *vk, ctx);
+ 		if(r == 0)
+ 			return i;
+@@ -991,6 +1154,30 @@ int LUKS_open_key_with_hdr(int keyIndex,
+ 	return -EPERM;
+ }
+ 
++static int NV_remove_keyslot(struct crypt_device *ctx,
++			     int keyIndex)
++{
++	log_dbg("Initializing TPM NVRAM storage for removing a second password");
++	if (nv_initialize() < 0) {
++		log_dbg("nvram initializiation failed");
++		return -EINVAL;
++	}
++
++	struct nv_keyslot *ks = nv_keyslot_by_uuid(crypt_get_uuid(ctx), keyIndex);
++	if (ks == NULL) {
++		log_dbg("no keyslot found for uuid %s (index %d)",
++				crypt_get_uuid(ctx), keyIndex);
++		return 0;
++	}
++
++	if (nv_keyslot_remove(ks) < 0) {
++		log_dbg("failed to remove keyslot from TPM NVRAM");
++	}
++	nv_keyslot_free(ks);
++
++	return 0;
++}
++
+ int LUKS_del_key(unsigned int keyIndex,
+ 		 struct luks_phdr *hdr,
+ 		 struct crypt_device *ctx)
+@@ -1033,6 +1220,13 @@ int LUKS_del_key(unsigned int keyIndex,
+ 	hdr->keyblock[keyIndex].passwordIterations = 0;
+ 
+ 	r = LUKS_write_phdr(hdr, ctx);
++	if (r)
++		return r;
++
++	if (crypt_nvram_in_use(ctx)) {
++		r = NV_remove_keyslot(ctx, keyIndex);
++		log_std(ctx, "removed password from TPM NVRAM\n");
++	}
+ 
+ 	return r;
+ }
+diff --git a/lib/setup.c b/lib/setup.c
+index ad77b14..f5a7351 100644
+--- a/lib/setup.c
++++ b/lib/setup.c
+@@ -98,6 +98,9 @@ struct crypt_device {
+ 
+ 	/* last error message */
+ 	char error[MAX_ERROR_LENGTH];
++
++	/* use nvram */
++	bool use_nvram;
+ };
+ 
+ /* Just to suppress redundant messages about crypto backend */
+@@ -638,6 +641,16 @@ bad:
+ 	return r;
+ }
+ 
++void crypt_use_nvram(struct crypt_device *cd, bool use_nvram)
++{
++	cd->use_nvram = use_nvram;
++}
++
++bool crypt_nvram_in_use(struct crypt_device *cd)
++{
++	return cd->use_nvram;
++}
++
+ static int crypt_check_data_device_size(struct crypt_device *cd)
+ {
+ 	int r;
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5ed987d..6e90253 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -20,6 +20,7 @@ cryptsetup_SOURCES = \
+ cryptsetup_LDADD = \
+ 	$(top_builddir)/lib/libcryptsetup.la	\
+ 	@POPT_LIBS@				\
++	@NVCRYPT_LIBS@				\
+ 	@PWQUALITY_LIBS@
+ 
+ cryptsetup_CFLAGS = $(AM_CFLAGS) -Wall
+@@ -50,6 +51,7 @@ veritysetup_SOURCES = \
+ 
+ veritysetup_LDADD = \
+ 	$(top_builddir)/lib/libcryptsetup.la	\
++	@NVCRYPT_LIBS@				\
+ 	@POPT_LIBS@
+ 
+ veritysetup_CFLAGS = $(cryptsetup_CFLAGS)
+diff --git a/src/cryptsetup.c b/src/cryptsetup.c
+index d523dc9..64bae4e 100644
+--- a/src/cryptsetup.c
++++ b/src/cryptsetup.c
+@@ -23,6 +23,8 @@
+ 
+ #include "cryptsetup.h"
+ 
++#include <libnvcrypt.h>
++
+ static const char *opt_cipher = NULL;
+ static const char *opt_hash = NULL;
+ static int opt_verify_passphrase = 0;
+@@ -64,6 +66,7 @@ static int opt_tcrypt_hidden = 0;
+ static int opt_tcrypt_system = 0;
+ static int opt_tcrypt_backup = 0;
+ static int opt_veracrypt = 0;
++static int opt_use_nvram = 0;
+ 
+ static const char **action_argv;
+ static int action_argc;
+@@ -656,6 +659,8 @@ static int action_luksRepair(void)
+ 	if ((r = crypt_init(&cd, action_argv[0])))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
++
+ 	/* Currently only LUKS1 allows repair */
+ 	crypt_set_log_callback(cd, quiet_log, NULL);
+ 	r = crypt_load(cd, CRYPT_LUKS1, NULL);
+@@ -718,6 +723,7 @@ static int action_luksFormat(void)
+ 		goto out;
+ 	}
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	keysize = (opt_key_size ?: DEFAULT_LUKS1_KEYBITS) / 8;
+ 
+ 	crypt_set_timeout(cd, opt_timeout);
+@@ -786,6 +792,7 @@ static int action_open_luks(void)
+ 		goto out;
+ 	}
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_timeout(cd, opt_timeout);
+ 	crypt_set_password_retry(cd, opt_tries);
+ 	crypt_set_password_verify(cd, _verify_passphrase(0));
+@@ -869,6 +876,7 @@ static int action_luksKillSlot(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 	crypt_set_timeout(cd, opt_timeout);
+ 
+@@ -912,6 +920,7 @@ static int action_luksRemoveKey(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 	crypt_set_timeout(cd, opt_timeout);
+ 
+@@ -963,6 +972,7 @@ static int action_luksAddKey(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 
+ 	if ((r = crypt_load(cd, CRYPT_LUKS1, NULL)))
+@@ -1050,6 +1060,7 @@ static int action_luksChangeKey(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	if ((r = crypt_load(cd, CRYPT_LUKS1, NULL)))
+ 		goto out;
+ 
+@@ -1105,6 +1116,7 @@ static int action_isLuks(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_log_callback(cd, quiet_log, NULL);
+ 	r = crypt_load(cd, CRYPT_LUKS1, NULL);
+ out:
+@@ -1121,6 +1133,7 @@ static int action_luksUUID(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 
+ 	if ((r = crypt_load(cd, CRYPT_LUKS1, NULL)))
+@@ -1200,6 +1213,7 @@ static int action_luksDump(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	if ((r = crypt_load(cd, CRYPT_LUKS1, NULL)))
+ 		goto out;
+ 
+@@ -1233,6 +1247,7 @@ static int action_luksResume(void)
+ 	if ((r = crypt_init_by_name_and_header(&cd, action_argv[0], uuid_or_device(opt_header_device))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_timeout(cd, opt_timeout);
+ 	crypt_set_password_retry(cd, opt_tries);
+ 	crypt_set_password_verify(cd, _verify_passphrase(0));
+@@ -1261,6 +1276,7 @@ static int action_luksBackup(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 
+ 	r = crypt_header_backup(cd, CRYPT_LUKS1, opt_header_backup_file);
+@@ -1282,6 +1298,7 @@ static int action_luksRestore(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 	r = crypt_header_restore(cd, CRYPT_LUKS1, opt_header_backup_file);
+ out:
+@@ -1329,6 +1346,7 @@ static int action_luksErase(void)
+ 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
+ 		goto out;
+ 
++	crypt_use_nvram(cd, opt_use_nvram);
+ 	crypt_set_confirm_callback(cd, yesDialog, NULL);
+ 
+ 	if ((r = crypt_load(cd, CRYPT_LUKS1, NULL)))
+@@ -1346,6 +1364,25 @@ static int action_luksErase(void)
+ 		goto out;
+ 	}
+ 
++	if (nv_initialize() < 0) {
++		log_dbg("nvram initializiation failed");
++	} else {
++		for (i = 0; i < crypt_keyslot_max(CRYPT_LUKS1); i++) {
++			struct nv_keyslot *ks = nv_keyslot_by_uuid(crypt_get_uuid(cd), i);
++			if (ks == NULL) {
++				log_dbg("no keyslot found for uuid %s (index %d)\n",
++						crypt_get_uuid(cd), i);
++				continue;
++			}
++
++			if (nv_keyslot_remove(ks) < 0) {
++				log_dbg("failed to remove keyslot from TPM NVRAM");
++			}
++			log_std("removed password from TPM NVRAM\n");
++			nv_keyslot_free(ks);
++		}
++	}
++	
+ 	for (i = 0; i < crypt_keyslot_max(CRYPT_LUKS1); i++) {
+ 		ki = crypt_keyslot_status(cd, i);
+ 		if (ki == CRYPT_SLOT_ACTIVE || ki == CRYPT_SLOT_ACTIVE_LAST) {
+@@ -1503,6 +1540,7 @@ int main(int argc, const char **argv)
+ 		{ "offset",            'o',  POPT_ARG_STRING, &popt_tmp,                2, N_("The start offset in the backend device"), N_("SECTORS") },
+ 		{ "skip",              'p',  POPT_ARG_STRING, &popt_tmp,                3, N_("How many sectors of the encrypted data to skip at the beginning"), N_("SECTORS") },
+ 		{ "readonly",          'r',  POPT_ARG_NONE, &opt_readonly,              0, N_("Create a readonly mapping"), NULL },
++		{ "use-nvram",         '\0', POPT_ARG_NONE, &opt_use_nvram,             0, N_("Use a second password in TPM NVRAM"), NULL },
+ 		{ "iter-time",         'i',  POPT_ARG_INT, &opt_iteration_time,         0, N_("PBKDF2 iteration time for LUKS (in ms)"), N_("msecs") },
+ 		{ "batch-mode",        'q',  POPT_ARG_NONE, &opt_batch_mode,            0, N_("Do not ask for confirmation"), NULL },
+ 		{ "timeout",           't',  POPT_ARG_INT, &opt_timeout,                0, N_("Timeout for interactive passphrase prompt (in seconds)"), N_("secs") },
